@@ -85,11 +85,13 @@ type SelectRequest struct {
 }
 
 type SelectResponse struct {
-	OK      bool   `json:"ok"`
-	Host    string `json:"host"`
-	Port    int    `json:"port"`
-	AuthIP  string `json:"authIp,omitempty"`
-	Error   string `json:"error,omitempty"`
+	OK          bool   `json:"ok"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	AuthIP      string `json:"authIp,omitempty"`
+	CharacterID int    `json:"characterId,omitempty"`
+	Channel     int    `json:"channel,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 func (c *Client) Health() (*HealthResponse, error) {
