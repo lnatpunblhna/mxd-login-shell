@@ -51,12 +51,28 @@ func main() {
 
 	login, err := client.Login(username, password)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "login request failed: %v\n", err)
-		os.Exit(1)
+		if strings.Contains(err.Error(), "already_logged_in") {
+			fmt.Fprintln(os.Stderr, "account was online; unlocked — retrying login once")
+			login, err = client.Login(username, password)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "login request failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	if !login.OK {
-		fmt.Fprintf(os.Stderr, "login rejected: %s\n", login.Error)
-		os.Exit(1)
+		if login.Error == "already_logged_in" {
+			fmt.Fprintln(os.Stderr, "account was online; unlocked — retrying login once")
+			login, err = client.Login(username, password)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "login request failed: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		if !login.OK {
+			fmt.Fprintf(os.Stderr, "login rejected: %s\n", login.Error)
+			os.Exit(1)
+		}
 	}
 	fmt.Printf("logged in accountId=%d gm=%d\n", login.AccountID, login.GM)
 
