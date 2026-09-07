@@ -14,31 +14,34 @@ CMS079（盛大/国服 079）**Go 登录壳**：登录 / 选区 / 选角后，�
      |                              putLoginAuth(charId, authIp, …)
      |
      +-- 写 handoff.json（客户端目录旁）
-     +-- 启动短命本地 shim（127.0.0.1:随机端口）  [Phase1: Hello+日志]
+     +-- 启动短命本地 shim（127.0.0.1:随机端口）
      +-- 拉起 MapleStory.exe 127.0.0.1 <shimPort>
             │
-            └── (Phase2 TODO) shim 发加密 SERVER_IP → 客户端连真实频道
+            └── shim: Hello → MapleAES+Shanda → 假登录 → 加密 SERVER_IP(0x0B)
+                → 客户端连真实频道
 ```
 
 Stock 客户端正常启动方式是 `MapleStory.exe <ip> <loginPort>`（例如 `127.0.0.1 9595`），**自己跑登录 UI**。因此只把 exe 指到频道端口不够：频道在等 `PLAYER_LOGGEDIN`，而客户端以为自己在登录服。
 
 Scheme A：Go 壳先 `select`（服务端已 `putLoginAuth`），再让客户端连本地假登录；假登录最终下发 `getServerIP`（opcode `0x0B`），客户端才会去真实频道。
 
-## 当前能力（Phase 1）
+## 当前能力（Phase 2）
 
 - CLI：`/health` → `/api/login` → `/api/worlds` → `/api/characters` → `/api/select`
 - `internal/launcher`：Windows 优先拉起 `MapleStory.exe <ip> <port>`（`-client` / `MXD_CLIENT`）
-- `internal/handoff`：在客户端旁写入 `handoff.json`（host/port/charId/authIp/timestamp）
-- `internal/shim`：本机 TCP 监听 + 发送 CMS079 **Hello** + 记录后续加密流量；**尚未**实现 MapleAES / 假登录包 / 加密 `SERVER_IP`
+- `internal/handoff`：在客户端旁写入 `handoff.json`
+- `internal/maplecrypto`：忠实移植 `MapleAESOFB` + `MapleCustomEncryption`（funnyBytes / IV / AES-ECB OFB + Shanda）
+- `internal/shim`：Hello → 解密客户端包 → 最小假登录（`LOGIN_STATUS` / `SERVERLIST` / `SERVERSTATUS` / `CHARLIST` stub）→ **加密** `SERVER_IP 0x0B`
 
-### 仍 TODO（Phase 2）
+### 假登录说明
 
-1. 移植 `MapleAESOFB`（AES-ECB OFB + funnyBytes IV）
-2. 解密客户端包并应答最小登录序列（`LOGIN_STATUS` / `SERVERLIST` / `CHARLIST` 等）
-3. 加密发送 `MaplePacketCreator.getServerIP`（`0x0B` + IP + port + charId）
-4. 确认 `putLoginAuth` 的 **authIp** 与客户端出站 IP 一致
+客户端仍会看到登录/选角 UI，但 shim 用 Go 壳已选角色的 id/name 回填 `CHARLIST`；选角后下发真实频道的 `SERVER_IP`。`CHARLIST` 外观为裸装 stub（face/hair 默认），仅用于点选交接，不以还原装备为准。
 
-明文 `SERVER_IP` 拼包已在 `internal/shim/packets.go`（`BuildServerIPPlain`），待套 AES 头后即可试。
+### 仍需留意
+
+1. 确认 `putLoginAuth` 的 **authIp** 与客户端出站 IP 一致
+2. 实机联调：若客户端卡在某 opcode，对照 `recvops.properties` / `LoginPacket` 补应答
+3. `LICENSE_REQUEST` / `SET_GENDER` 目前复用 `LOGIN_STATUS` 成功包，不适合未设性别的新号
 
 ## 用法
 
@@ -60,6 +63,7 @@ go run ./cmd/shell -user you -pass secret
 1. 打印频道 `host:port` 与 `authIp`
 2. 写 `handoff.json` 到客户端目录
 3. 启动本地 shim，并执行 `MapleStory.exe 127.0.0.1 <shimPort>`
+4. shim 完成假登录后下发加密 `SERVER_IP`，客户端转连真实频道
 
 ### 其它开关
 
@@ -83,8 +87,15 @@ go run ./cmd/shell -user you -pass secret
 
 LoginBridge 在 Java 侧。拉过 `MapleStory` 更新或合并 bridge 后，请重新编译打包并重启服务端，否则 Go 壳会连到旧进程（无 `/api/select` 等）。
 
+### 测试
+
+```bash
+go test ./...
+```
+
 ## 相关
 
 - 服务端 LoginBridge：`src/handling/login/bridge/*`
 - 角色进入频道前的原版路径：`CharLoginHandler.Character_WithoutSecondPassword` → `getServerIP`
-- 握手：`LoginPacket.getHello` / `MapleAESOFB`
+- 握手 / 加密：`LoginPacket.getHello` / `MapleAESOFB` / `MapleCustomEncryption` / mina Encoder·Decoder
+- Go 移植：`internal/maplecrypto`

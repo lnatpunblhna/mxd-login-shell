@@ -1,19 +1,21 @@
 // Package shim is the Scheme A local fake-login helper.
 //
-// Phase 1 (this PR): listen on 127.0.0.1, send CMS079 Hello, log client bytes.
-// Phase 2 (TODO): MapleAESOFB + minimal login/world/char packets + encrypted SERVER_IP
-// so the stock client thinks char-select finished and reconnects to the real channel
-// where LoginServer.putLoginAuth already waits.
+// Phase 2: Hello → MapleAES+Shanda session → minimal CMS079 login/world/char
+// responses → encrypted SERVER_IP (0x0B) so the stock client reconnects to the
+// real channel where LoginServer.putLoginAuth already waits.
 package shim
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/lnatpunblhna/mxd-login-shell/internal/maplecrypto"
 )
 
 // Config describes the real channel handoff already registered via putLoginAuth.
@@ -23,6 +25,16 @@ type Config struct {
 	CharID      int
 	AuthIP      string
 	Log         io.Writer
+
+	// Optional identity for LOGIN_STATUS / CHARLIST stubs (filled from Go shell).
+	AccountID   int
+	AccountName string
+	Gender      byte
+	GM          bool
+	CharName    string
+	CharLevel   byte
+	CharJob     uint16
+	WorldName   string
 }
 
 // Server is a short-lived local listener.
@@ -31,13 +43,25 @@ type Server struct {
 	ln       net.Listener
 	mu       sync.Mutex
 	closed   bool
-	plainSIP []byte // prebuilt plaintext SERVER_IP for Phase 2
+	plainSIP []byte
 }
 
-// Start listens on 127.0.0.1:0 and accepts one (or a few) client connections.
+// Start listens on 127.0.0.1:0 and accepts client connections.
 func Start(cfg Config) (*Server, error) {
 	if cfg.Log == nil {
 		cfg.Log = os.Stderr
+	}
+	if cfg.WorldName == "" {
+		cfg.WorldName = "World0"
+	}
+	if cfg.AccountName == "" {
+		cfg.AccountName = "player"
+	}
+	if cfg.CharName == "" {
+		cfg.CharName = "Hero"
+	}
+	if cfg.CharLevel == 0 {
+		cfg.CharLevel = 1
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -50,24 +74,18 @@ func Start(cfg Config) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, ln: ln, plainSIP: sip}
 	go s.serve()
-	fmt.Fprintf(cfg.Log, "shim listening on %s → will eventually redirect to %s:%d charId=%d (authIp=%s)\n",
+	fmt.Fprintf(cfg.Log, "shim listening on %s → redirect to %s:%d charId=%d (authIp=%s)\n",
 		ln.Addr().String(), cfg.ChannelHost, cfg.ChannelPort, cfg.CharID, cfg.AuthIP)
-	fmt.Fprintf(cfg.Log, "shim Phase1: Hello + log only. TODOs: MapleAESOFB IV/crypt, fake LOGIN_STATUS/SERVERLIST/CHARLIST, encrypt SERVER_IP 0x0B (%d plaintext bytes ready)\n", len(sip))
+	fmt.Fprintf(cfg.Log, "shim Phase2: Hello + MapleAES/Shanda + fake login → encrypted SERVER_IP (%d plaintext bytes)\n", len(sip))
 	return s, nil
 }
 
-// Addr returns the listen address (host:port).
-func (s *Server) Addr() string {
-	return s.ln.Addr().String()
-}
+func (s *Server) Addr() string { return s.ln.Addr().String() }
 
-// Port returns the TCP port.
 func (s *Server) Port() int {
-	a := s.ln.Addr().(*net.TCPAddr)
-	return a.Port
+	return s.ln.Addr().(*net.TCPAddr).Port
 }
 
-// Close stops the listener.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,10 +117,9 @@ func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
 	fmt.Fprintf(s.cfg.Log, "shim: client connected from %s\n", remote)
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	var sendIV, recvIV [4]byte
-	// Match MapleServerHandler sessionOpened seed style (partially random last byte).
 	copy(sendIV[:], []byte{82, 48, 120, 0})
 	copy(recvIV[:], []byte{70, 114, 122, 0})
 	_, _ = rand.Read(sendIV[3:])
@@ -115,18 +132,111 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	fmt.Fprintf(s.cfg.Log, "shim: sent Hello (v%d) sendIV=%x recvIV=%x (%d bytes)\n", MapleVersion, sendIV, recvIV, len(hello))
 
-	// TODO(Phase2): initialize MapleAESOFB
-	//   sendCrypt := AES(sendIV, 65535-79)  // server→client
-	//   recvCrypt := AES(recvIV, 79)        // client→server
-	// then read 4-byte headers, decrypt payloads, respond to login opcodes,
-	// finally: header+encrypt(BuildServerIPPlain(...)) and close.
+	sendCrypt, err := maplecrypto.NewAESOFB(sendIV[:], 65535-MapleVersion)
+	if err != nil {
+		fmt.Fprintf(s.cfg.Log, "shim: send AES: %v\n", err)
+		return
+	}
+	recvCrypt, err := maplecrypto.NewAESOFB(recvIV[:], MapleVersion)
+	if err != nil {
+		fmt.Fprintf(s.cfg.Log, "shim: recv AES: %v\n", err)
+		return
+	}
 
-	buf := make([]byte, 4096)
-	for {
-		n, err := conn.Read(buf)
+	sendPacket := func(plain []byte) error {
+		wire := maplecrypto.EncodeSend(sendCrypt, plain)
+		_, err := conn.Write(wire)
+		return err
+	}
+
+	handedOff := false
+	buf := make([]byte, 0, 8192)
+	tmp := make([]byte, 4096)
+	for !handedOff {
+		n, err := conn.Read(tmp)
 		if n > 0 {
-			fmt.Fprintf(s.cfg.Log, "shim: recv %d bytes from client (encrypted; need MapleAESOFB to parse): %x\n", n, buf[:min(n, 64)])
-			_ = s.plainSIP // keep referenced for Phase 2 wiring
+			buf = append(buf, tmp[:n]...)
+		}
+		for {
+			if len(buf) < 4 {
+				break
+			}
+			if !recvCrypt.CheckPacket(buf[:4]) {
+				fmt.Fprintf(s.cfg.Log, "shim: bad packet header %x (iv=%x) — closing\n", buf[:4], recvCrypt.IV())
+				return
+			}
+			bodyLen := maplecrypto.GetPacketLengthBytes(buf[:4])
+			if bodyLen < 0 || bodyLen > 1<<20 {
+				fmt.Fprintf(s.cfg.Log, "shim: absurd bodyLen=%d\n", bodyLen)
+				return
+			}
+			if len(buf) < 4+bodyLen {
+				break
+			}
+			hdr := buf[:4]
+			cipherBody := append([]byte(nil), buf[4:4+bodyLen]...)
+			buf = buf[4+bodyLen:]
+			_ = hdr
+			plain := maplecrypto.DecodeRecv(recvCrypt, cipherBody)
+			if len(plain) < 2 {
+				fmt.Fprintf(s.cfg.Log, "shim: short packet %x\n", plain)
+				continue
+			}
+			op := binary.LittleEndian.Uint16(plain[0:2])
+			fmt.Fprintf(s.cfg.Log, "shim: client opcode 0x%02X (%d bytes)\n", op, len(plain))
+
+			switch op {
+			case RecvPong:
+				if err := sendPacket(BuildPing()); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: ping: %v\n", err)
+					return
+				}
+			case RecvLoginPassword, RecvLicenseRequest, RecvSetGender:
+				pkt := BuildLoginStatusSuccess(s.cfg.AccountID, s.cfg.Gender, s.cfg.GM, s.cfg.AccountName)
+				if err := sendPacket(pkt); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: LOGIN_STATUS: %v\n", err)
+					return
+				}
+				fmt.Fprintf(s.cfg.Log, "shim: sent LOGIN_STATUS success\n")
+			case RecvServerListRequest:
+				if err := sendPacket(BuildServerListOneWorld(0, s.cfg.WorldName, 1)); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: SERVERLIST: %v\n", err)
+					return
+				}
+				if err := sendPacket(BuildEndOfServerList()); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: SERVERLIST end: %v\n", err)
+					return
+				}
+				fmt.Fprintf(s.cfg.Log, "shim: sent SERVERLIST + end\n")
+			case RecvServerStatusRequest:
+				if err := sendPacket(BuildServerStatus(0)); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: SERVERSTATUS: %v\n", err)
+					return
+				}
+			case RecvCharListRequest:
+				ch := FakeChar{
+					ID:     s.cfg.CharID,
+					Name:   s.cfg.CharName,
+					Level:  s.cfg.CharLevel,
+					Job:    s.cfg.CharJob,
+					Gender: s.cfg.Gender,
+				}
+				if err := sendPacket(BuildCharListOne(ch, 3)); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: CHARLIST: %v\n", err)
+					return
+				}
+				fmt.Fprintf(s.cfg.Log, "shim: sent CHARLIST stub id=%d name=%s\n", ch.ID, ch.Name)
+			case RecvCharSelect:
+				if err := sendPacket(append([]byte(nil), s.plainSIP...)); err != nil {
+					fmt.Fprintf(s.cfg.Log, "shim: SERVER_IP: %v\n", err)
+					return
+				}
+				fmt.Fprintf(s.cfg.Log, "shim: sent encrypted SERVER_IP → %s:%d charId=%d — handoff done\n",
+					s.cfg.ChannelHost, s.cfg.ChannelPort, s.cfg.CharID)
+				handedOff = true
+			default:
+				fmt.Fprintf(s.cfg.Log, "shim: unhandled opcode 0x%02X payload=%x\n", op, plain[:min(len(plain), 32)])
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -137,6 +247,8 @@ func (s *Server) handle(conn net.Conn) {
 			return
 		}
 	}
+	// Give the client a moment to read SERVER_IP before we drop the TCP session.
+	time.Sleep(500 * time.Millisecond)
 }
 
 func min(a, b int) int {

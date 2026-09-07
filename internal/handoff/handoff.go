@@ -34,7 +34,7 @@ func WriteBesideClient(clientPath string, info Info) (string, error) {
 		info.Scheme = "A"
 	}
 	if info.Note == "" {
-		info.Note = "Phase1: launcher + stub shim. Remaining: MapleAESOFB + encrypted SERVER_IP (0x0B) after fake login so stock client skips its own UI."
+		info.Note = "Phase2: shim Hello + MapleAES/Shanda + fake login + encrypted SERVER_IP (0x0B) -> real channel."
 	}
 
 	dir, err := resolveClientDir(clientPath)
@@ -65,15 +65,12 @@ func resolveClientDir(clientPath string) (string, error) {
 	return filepath.Dir(clientPath), nil
 }
 
-// DocRemaining returns the human-readable Phase-2 checklist.
+// DocRemaining returns the human-readable Phase-2 status note.
 func DocRemaining() string {
-	return fmt.Sprintf(`Scheme A remaining work (see internal/shim):
-  1. Port MapleAESOFB (AES-ECB OFB + funnyBytes IV rollover) from MapleStory src/tools/MapleAESOFB.java
-  2. After Hello, decrypt client packets (header check + crypt)
-  3. Minimal fake-login sequence until client will accept SERVER_IP:
-     LOGIN_STATUS → SERVERLIST → CHARLIST (or the CMS079 subset your client expects)
-  4. Encrypt+send getServerIP: opcode 0x0B, short 0, IPv4(host), short(port), int(charId), {1,0,0,0,0}
-     (Java: MaplePacketCreator.getServerIP)
-  5. Client then connects to real channel; putLoginAuth(charId, authIp, …) must match client outbound IP
+	return fmt.Sprintf(`Scheme A Phase2 wired (see internal/maplecrypto + internal/shim):
+  - MapleAESOFB + MapleCustomEncryption (Shanda) ported
+  - Fake login: LOGIN_STATUS / SERVERLIST / SERVERSTATUS / CHARLIST stub
+  - Encrypted SERVER_IP 0x0B on CHAR_SELECT
+  Still verify: authIp matches client outbound IP; live client may need extra opcode replies
 `)
 }

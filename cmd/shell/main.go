@@ -153,6 +153,14 @@ func main() {
 			CharID:      charID,
 			AuthIP:      sel.AuthIP,
 			Log:         os.Stderr,
+			AccountID:   login.AccountID,
+			AccountName: username,
+			Gender:      byte(login.Gender),
+			GM:          login.GM != 0,
+			CharName:    picked.Name,
+			CharLevel:   byte(picked.Level),
+			CharJob:     uint16(picked.Job),
+			WorldName:   w.Name,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "shim start failed: %v\n", err)
@@ -162,8 +170,8 @@ func main() {
 		launchIP = "127.0.0.1"
 		launchPort = shimSrv.Port()
 		info.ShimAddr = shimSrv.Addr()
-		info.Note = "Phase1 stub shim: Hello+log. Stock client will NOT reach channel until MapleAES + SERVER_IP redirect is finished."
-		fmt.Printf("Scheme A: launching client at local shim %s (real channel %s:%d)\n", shimSrv.Addr(), sel.Host, sel.Port)
+		info.Note = "Phase2 shim: Hello + MapleAES/Shanda + fake login + encrypted SERVER_IP handoff."
+		fmt.Printf("Scheme A Phase2: launching client at local shim %s (real channel %s:%d)\n", shimSrv.Addr(), sel.Host, sel.Port)
 	} else if *direct {
 		info.Scheme = "direct"
 		info.Note = "Direct launch at channel. Stock MapleStory.exe still runs its own login UI — putLoginAuth alone is not enough."
@@ -209,7 +217,7 @@ func main() {
 	_ = proc
 
 	if shimSrv != nil {
-		fmt.Print("client launched against Phase1 shim — press Enter to stop shim… ")
+		fmt.Print("client launched against Phase2 shim — press Enter to stop shim… ")
 		_, _ = in.ReadString('\n')
 	}
 }
