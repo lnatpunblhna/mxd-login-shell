@@ -7,21 +7,30 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lnatpunblhna/mxd-login-shell/internal/bridge"
+	"github.com/lnatpunblhna/mxd-login-shell/internal/handoff"
+	"github.com/lnatpunblhna/mxd-login-shell/internal/launcher"
+	"github.com/lnatpunblhna/mxd-login-shell/internal/shim"
 )
 
 func main() {
 	bridgeURL := flag.String("bridge", "http://127.0.0.1:17979", "CMS079 LoginBridge base URL (localhost only)")
 	user := flag.String("user", "", "account username (optional; prompts if empty)")
 	pass := flag.String("pass", "", "account password (optional; prompts if empty)")
+	clientPath := flag.String("client", "", "path to MapleStory.exe (or its folder); default env MXD_CLIENT")
+	direct := flag.Bool("direct", false, "launch at real channel host:port instead of local Scheme A shim (stock client will show its own login UI)")
+	noLaunch := flag.Bool("no-launch", false, "after select, only write handoff.json — do not start shim/client")
 	flag.Parse()
+
+	resolvedClient := launcher.ResolvePath(*clientPath)
 
 	client := bridge.NewClient(*bridgeURL)
 	health, err := client.Health()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bridge unreachable at %s: %v\n", *bridgeURL, err)
-		fmt.Fprintln(os.Stderr, "Checkout feat/login-bridge, rebuild maple.jar, start the server, then retry.")
+		fmt.Fprintln(os.Stderr, "Checkout MapleStory (login-bridge merged), rebuild maple.jar, start the server, then retry.")
 		os.Exit(1)
 	}
 	fmt.Printf("bridge ok: %+v\n", health)
@@ -86,14 +95,107 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bad index")
 		os.Exit(1)
 	}
+	picked := chars.Characters[idx]
 	ch := w.Channels[0]
-	sel, err := client.Select(chars.Characters[idx].ID, ch.ID)
+	sel, err := client.Select(picked.ID, ch.ID)
 	if err != nil || !sel.OK {
 		fmt.Fprintf(os.Stderr, "select failed: %v %s\n", err, selectErr(sel))
 		os.Exit(1)
 	}
-	fmt.Printf("handoff ready → %s:%d (authIp=%s)\n", sel.Host, sel.Port, sel.AuthIP)
-	fmt.Println("next: launch stock CMS079 client into that channel (launcher TODO)")
+
+	charID := sel.CharacterID
+	if charID == 0 {
+		charID = picked.ID
+	}
+	channelID := sel.Channel
+	if channelID == 0 {
+		channelID = ch.ID
+	}
+
+	fmt.Printf("handoff ready → channel %s:%d charId=%d (authIp=%s)\n", sel.Host, sel.Port, charID, sel.AuthIP)
+	fmt.Println("note: putLoginAuth IP must match the stock client's outbound IP (authIp above).")
+	fmt.Print(handoff.DocRemaining())
+
+	info := handoff.Info{
+		Host:      sel.Host,
+		Port:      sel.Port,
+		CharID:    charID,
+		AuthIP:    sel.AuthIP,
+		Channel:   channelID,
+		Scheme:    "A",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	var shimSrv *shim.Server
+	launchIP := sel.Host
+	launchPort := sel.Port
+
+	if !*noLaunch && !*direct {
+		shimSrv, err = shim.Start(shim.Config{
+			ChannelHost: sel.Host,
+			ChannelPort: sel.Port,
+			CharID:      charID,
+			AuthIP:      sel.AuthIP,
+			Log:         os.Stderr,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shim start failed: %v\n", err)
+			os.Exit(1)
+		}
+		defer shimSrv.Close()
+		launchIP = "127.0.0.1"
+		launchPort = shimSrv.Port()
+		info.ShimAddr = shimSrv.Addr()
+		info.Note = "Phase1 stub shim: Hello+log. Stock client will NOT reach channel until MapleAES + SERVER_IP redirect is finished."
+		fmt.Printf("Scheme A: launching client at local shim %s (real channel %s:%d)\n", shimSrv.Addr(), sel.Host, sel.Port)
+	} else if *direct {
+		info.Scheme = "direct"
+		info.Note = "Direct launch at channel. Stock MapleStory.exe still runs its own login UI — putLoginAuth alone is not enough."
+		fmt.Printf("direct: launching client at channel %s:%d (own login UI expected)\n", launchIP, launchPort)
+	}
+
+	if resolvedClient != "" {
+		path, err := handoff.WriteBesideClient(resolvedClient, info)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "handoff.json write failed: %v\n", err)
+		} else {
+			fmt.Printf("wrote %s\n", path)
+		}
+	} else {
+		path, err := handoff.WriteBesideClient(".", info)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "handoff.json write failed: %v\n", err)
+		} else {
+			fmt.Printf("wrote %s (no -client; cwd)\n", path)
+		}
+	}
+
+	if *noLaunch {
+		fmt.Println("no-launch: skipping MapleStory.exe")
+		return
+	}
+
+	if resolvedClient == "" {
+		fmt.Fprintln(os.Stderr, "no client path: pass -client C:\\path\\to\\MapleStory.exe or set MXD_CLIENT")
+		fmt.Fprintln(os.Stderr, "handoff is ready; start the exe manually when you have a path")
+		if shimSrv != nil {
+			fmt.Print("shim running — press Enter to stop… ")
+			_, _ = in.ReadString('\n')
+		}
+		return
+	}
+
+	proc, err := launcher.Start(resolvedClient, launchIP, launchPort)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "launcher failed: %v\n", err)
+		os.Exit(1)
+	}
+	_ = proc
+
+	if shimSrv != nil {
+		fmt.Print("client launched against Phase1 shim — press Enter to stop shim… ")
+		_, _ = in.ReadString('\n')
+	}
 }
 
 func worldsErr(w *bridge.WorldsResponse) string {
