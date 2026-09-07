@@ -3,6 +3,8 @@ package shim
 import (
 	"encoding/binary"
 	"testing"
+
+	"github.com/lnatpunblhna/mxd-login-shell/internal/maplecrypto"
 )
 
 func TestBuildHelloLength(t *testing.T) {
@@ -40,5 +42,59 @@ func TestBuildServerIPPlain(t *testing.T) {
 	}
 	if binary.LittleEndian.Uint32(p[10:14]) != 42 {
 		t.Fatalf("charId")
+	}
+}
+
+func TestLoginStatusHasOpcode(t *testing.T) {
+	p := BuildLoginStatusSuccess(7, 0, false, "testacc")
+	if binary.LittleEndian.Uint16(p[0:2]) != OpcodeLoginStatus {
+		t.Fatalf("op")
+	}
+	if p[2] != 0 {
+		t.Fatalf("status")
+	}
+}
+
+func TestCharListOneRoundTripEncrypt(t *testing.T) {
+	ch := FakeChar{ID: 42, Name: "Hero", Level: 10, Job: 100, Gender: 0}
+	plain := BuildCharListOne(ch, 3)
+	if binary.LittleEndian.Uint16(plain[0:2]) != OpcodeCharList {
+		t.Fatalf("opcode")
+	}
+	send, err := maplecrypto.NewAESOFB([]byte{1, 2, 3, 4}, 65535-79)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := maplecrypto.NewAESOFB([]byte{1, 2, 3, 4}, 65535-79)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := maplecrypto.EncodeSend(send, plain)
+	if !peer.CheckPacket(wire[:4]) {
+		t.Fatalf("header")
+	}
+	body := maplecrypto.DecodeRecv(peer, wire[4:])
+	if binary.LittleEndian.Uint16(body[0:2]) != OpcodeCharList {
+		t.Fatalf("decoded op")
+	}
+}
+
+func TestServerIPEncryptHeader(t *testing.T) {
+	plain, err := BuildServerIPPlain("127.0.0.1", 8585, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send, _ := maplecrypto.NewAESOFB([]byte{82, 48, 120, 5}, 65535-79)
+	peer, _ := maplecrypto.NewAESOFB([]byte{82, 48, 120, 5}, 65535-79)
+	wire := maplecrypto.EncodeSend(send, plain)
+	if len(wire) != 4+len(plain) {
+		t.Fatalf("len")
+	}
+	if !peer.CheckPacket(wire[:4]) {
+		t.Fatalf("check")
+	}
+	got := maplecrypto.DecodeRecv(peer, wire[4:])
+	if binary.LittleEndian.Uint16(got[0:2]) != OpcodeServerIP {
+		t.Fatalf("op")
 	}
 }
